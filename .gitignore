@@ -19,7 +19,6 @@
 # documentation stays out of the repo, except the README screenshots
 /docs/*
 !/docs/images/
-!/docs/metal4-api-lessons.md
 # documentation for the logo files stays out too
 /assets/logo/README.md
 # per-machine settings (contain local folder paths)
