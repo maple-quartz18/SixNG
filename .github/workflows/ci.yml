@@ -16,6 +16,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Verify Metal-Rust dependency pin
+        run: python3 scripts/check_metal_rust_pin.py
       - name: Linux system libraries (audio, file dialogs, windowing)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libxkbcommon-dev libwayland-dev

@@ -109,9 +109,33 @@ pub struct Painter {
     residency: ResidencySet,
     argument_table: ArgumentTable,
     textures: HashMap<egui::TextureId, UiTexture>,
+    frame_slots: Vec<EguiFrameSlot>,
+    frame_slot: usize,
+}
+
+struct EguiFrameSlot {
+    allocator: metal_rust::metal4::CommandAllocator,
+    uniform_buffer: metal_rust::metal::Buffer,
+    vertex_buffer: metal_rust::metal::Buffer,
+    vertex_capacity: usize,
+    pending: Option<metal_rust::metal4::SubmittedCommandBuffers>,
 }
 
 impl Painter {
+    fn begin_frame_slot(&mut self) -> anyhow::Result<usize> {
+        let slot_index = self.frame_slot;
+        self.frame_slot = (slot_index + 1) % self.frame_slots.len().max(1);
+        let slot = self
+            .frame_slots
+            .get_mut(slot_index)
+            .context("egui MTL4 frame slot is missing")?;
+        if let Some(pending) = slot.pending.take() {
+            pending.wait()?;
+        }
+        slot.allocator.reset_safe()?;
+        Ok(slot_index)
+    }
+
     pub fn new(device: &Device) -> anyhow::Result<Self> {
         let compiler = device.new_mtl4_compiler(&CompilerDescriptor::new()?)?;
         let library_descriptor = LibraryDescriptor::new()?;
@@ -154,12 +178,36 @@ impl Painter {
         residency_descriptor.set_initial_capacity(128)?;
         let residency = device.new_residency_set(&residency_descriptor)?;
 
+        let mut frame_slots = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let allocator = device.new_mtl4_command_allocator()?;
+            let uniform_buffer = device.new_buffer(
+                std::mem::size_of::<UiUniforms>(),
+                ResourceOptions::SHARED,
+            )?;
+            let vertex_capacity = 1024 * 1024;
+            let vertex_buffer = device.new_buffer(vertex_capacity, ResourceOptions::SHARED)?;
+            residency.add_allocations(&[
+                ResidencyAllocation::Buffer(&uniform_buffer),
+                ResidencyAllocation::Buffer(&vertex_buffer),
+            ])?;
+            residency.commit()?;
+            frame_slots.push(EguiFrameSlot {
+                allocator,
+                uniform_buffer,
+                vertex_buffer,
+                vertex_capacity,
+                pending: None,
+            });
+        }
         Ok(Self {
             device: device.clone(),
             pipeline,
             residency,
             argument_table,
             textures: HashMap::new(),
+            frame_slots,
+            frame_slot: 0,
         })
     }
 
@@ -234,6 +282,7 @@ impl Painter {
             texture_delta.clear();
             return Ok(());
         }
+        let slot_index = self.begin_frame_slot()?;
         let mut draws = flatten_primitives(primitives)?;
         let mut vertices = Vec::new();
         for (primitive, first_vertex) in primitives.iter().zip(draws.iter_mut()) {
@@ -274,31 +323,51 @@ impl Painter {
                 size[1] as f32 / pixels_per_point,
             ],
         };
-        let uniform_buffer = self
-            .device
-            .new_buffer_with_bytes(bytemuck::bytes_of(&uniform), ResourceOptions::SHARED)?;
-        let vertex_buffer =
-            if vertices.is_empty() {
-                None
-            } else {
-                Some(self.device.new_buffer_with_bytes(
-                    bytemuck::cast_slice(&vertices),
-                    ResourceOptions::SHARED,
-                )?)
-            };
+        let uniform_buffer = {
+            let slot = self
+                .frame_slots
+                .get(slot_index)
+                .context("egui MTL4 uniform slot is missing")?;
+            slot.uniform_buffer.write(0, bytemuck::bytes_of(&uniform))?;
+            slot.uniform_buffer.clone()
+        };
+        let vertex_buffer = if vertices.is_empty() {
+            None
+        } else {
+            let needed = bytemuck::cast_slice::<UiVertex, u8>(&vertices).len();
+            let slot = self
+                .frame_slots
+                .get_mut(slot_index)
+                .context("egui MTL4 vertex slot is missing")?;
+            if needed > slot.vertex_capacity {
+                let new_capacity = slot.vertex_capacity.max(needed).next_power_of_two();
+                let new_buffer =
+                    self.device.new_buffer(new_capacity, ResourceOptions::SHARED)?;
+                self.residency
+                    .remove_allocation(ResidencyAllocation::Buffer(&slot.vertex_buffer))?;
+                self.residency
+                    .add_allocation(ResidencyAllocation::Buffer(&new_buffer))?;
+                self.residency.commit()?;
+                slot.vertex_buffer = new_buffer;
+                slot.vertex_capacity = new_capacity;
+            }
+            slot
+                .vertex_buffer
+                .write(0, bytemuck::cast_slice::<UiVertex, u8>(&vertices))?;
+            Some(slot.vertex_buffer.clone())
+        };
 
-        let mut transient = vec![ResidencyAllocation::Buffer(&uniform_buffer)];
-        if let Some(vertex_buffer) = &vertex_buffer {
-            transient.push(ResidencyAllocation::Buffer(vertex_buffer));
-        }
-        self.residency.add_allocations(&transient)?;
-        self.residency.commit()?;
         self.argument_table.set_buffer(&uniform_buffer, 0, 0)?;
         if let Some(vertex_buffer) = &vertex_buffer {
             self.argument_table.set_buffer(vertex_buffer, 0, 1)?;
         }
 
-        let allocator = self.device.new_mtl4_command_allocator()?;
+        let allocator = self
+            .frame_slots
+            .get(slot_index)
+            .context("egui MTL4 allocator slot is missing")?
+            .allocator
+            .clone();
         let mut command_buffer = self
             .device
             .new_mtl4_command_buffer()?
@@ -342,10 +411,10 @@ impl Painter {
         let submission = queue.submit(vec![command_buffer.end()?], None)?;
         queue.signal_drawable(&drawable)?;
         drawable.present()?;
-        submission.wait()?;
-
-        self.residency.remove_allocations(&transient)?;
-        self.residency.commit()?;
+        self.frame_slots
+            .get_mut(slot_index)
+            .context("egui MTL4 submission slot is missing")?
+            .pending = Some(submission);
         self.free_textures(texture_delta)?;
         texture_delta.clear();
         Ok(())

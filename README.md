@@ -17,6 +17,21 @@ There is one Rust core library with two front ends:
 > files all go under `work/` (or any `--out` you choose). `work/` and every
 > `*.png/*.dds/*.glb` file are in `.gitignore`.
 
+### Updating the Metal-Rust pin
+
+SixNG pins `metal-rust` and `metal-rust-ffi` to the same exact Git revision in
+`Cargo.toml`, and `Cargo.lock` must resolve both packages to that same revision.
+Before updating the pin, verify that the upstream change passes Metal-Rust's
+inventory, safety, unit and GPU tests. Then update both patches and regenerate
+the lockfile:
+
+```sh
+cargo update -p metal-rust -p metal-rust-ffi --precise <commit>
+python3 scripts/check_metal_rust_pin.py
+```
+
+The pin checker is part of CI and rejects mismatched or incomplete revisions.
+
 | Shaded | UV checker + wireframe |
 |---|---|
 | ![Model viewer, shaded](docs/images/model_viewer.png) | ![Model viewer, UV checker](docs/images/model_viewer_uv.png) |

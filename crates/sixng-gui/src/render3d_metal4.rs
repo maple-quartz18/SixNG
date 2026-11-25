@@ -10,12 +10,13 @@ use metal_rust::metal::{
     IndexType, Library, LoadAction, PixelFormat, PrimitiveTopologyClass, PrimitiveType,
     RenderPassDepthAttachmentDescriptor, RenderStages, ResidencyAllocation, ResidencySet,
     ResidencySetDescriptor, ResourceOptions, SamplerAddressMode, SamplerDescriptor,
-    SamplerMinMagFilter, SamplerState, Stages, StoreAction, Texture, TextureDescriptor,
+    SamplerMinMagFilter, SamplerState, Stages, StoreAction, Buffer, Texture, TextureDescriptor,
     TextureUsage,
 };
 use metal_rust::metal4::{
     ArgumentTable, ArgumentTableDescriptor, BlendState, BufferImageLayout, CommandQueue,
-    CompilerDescriptor, LibraryDescriptor, LibraryFunctionDescriptor, RecordingRenderEncoder,
+    CommandAllocator, CompilerDescriptor, LibraryDescriptor, LibraryFunctionDescriptor,
+    RecordingRenderEncoder,
     RenderPassDescriptor, RenderPipelineBuildDescriptor, RenderPipelineColorAttachmentDescriptor,
     RenderPipelineDescriptor, TextureOriginSelection, TextureRegionSelection, VisibilityOptions,
 };
@@ -951,6 +952,11 @@ struct Target {
     depth_resident: bool,
 }
 
+struct SceneFrameSlot {
+    allocator: CommandAllocator,
+    frame_buffer: Buffer,
+}
+
 pub struct Renderer3D4 {
     device: Device,
     queue: CommandQueue,
@@ -967,11 +973,12 @@ pub struct Renderer3D4 {
     argument_table: ArgumentTable,
     sampler: SamplerState,
     fallback_texture: Texture,
-    frame_buffer: metal_rust::metal::Buffer,
     line_buffer: Option<metal_rust::metal::Buffer>,
     target: Option<Target>,
     readback: Option<metal_rust::metal::Buffer>,
     pub draws: u32,
+    scene_frame_slots: Vec<SceneFrameSlot>,
+    scene_frame_slot: usize,
     #[cfg(test)]
     last_texture_cache_hits: usize,
     temporal_mode: TemporalUpscaleMode,
@@ -987,6 +994,17 @@ pub struct Renderer3D4 {
 }
 
 impl Renderer3D4 {
+    fn begin_scene_frame_slot(&mut self) -> anyhow::Result<usize> {
+        let slot_index = self.scene_frame_slot;
+        self.scene_frame_slot = (slot_index + 1) % self.scene_frame_slots.len().max(1);
+        let slot = self
+            .scene_frame_slots
+            .get_mut(slot_index)
+            .context("scene MTL4 frame slot is missing")?;
+        slot.allocator.reset_safe()?;
+        Ok(slot_index)
+    }
+
     pub fn set_frame_generation_mode(&mut self, mode: FrameGenerationMode) {
         if self.frame_generation_mode != mode {
             self.frame_generation_mode = mode;
@@ -1089,12 +1107,18 @@ impl Renderer3D4 {
             &[255, 255, 255, 255],
             4,
         )?;
-        let frame_buffer =
-            device.new_buffer(std::mem::size_of::<FrameU>(), ResourceOptions::SHARED)?;
-        residency.add_allocations(&[
-            ResidencyAllocation::Texture(&fallback_texture),
-            ResidencyAllocation::Buffer(&frame_buffer),
-        ])?;
+        let mut scene_frame_slots = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let allocator = device.new_mtl4_command_allocator()?;
+            let frame_buffer =
+                device.new_buffer(std::mem::size_of::<FrameU>(), ResourceOptions::SHARED)?;
+            residency.add_allocations(&[ResidencyAllocation::Buffer(&frame_buffer)])?;
+            scene_frame_slots.push(SceneFrameSlot {
+                allocator,
+                frame_buffer,
+            });
+        }
+        residency.add_allocations(&[ResidencyAllocation::Texture(&fallback_texture)])?;
         residency.commit()?;
 
         Ok(Self {
@@ -1113,11 +1137,12 @@ impl Renderer3D4 {
             argument_table,
             sampler,
             fallback_texture,
-            frame_buffer,
             line_buffer: None,
             target: None,
             readback: None,
             draws: 0,
+            scene_frame_slots,
+            scene_frame_slot: 0,
             #[cfg(test)]
             last_texture_cache_hits: 0,
             temporal_mode: TemporalUpscaleMode::Off,
@@ -1903,6 +1928,7 @@ impl Renderer3D4 {
         {
             return Ok(egui::TextureId::User(MAP_TEXTURE_ID));
         }
+        let scene_slot_index = self.begin_scene_frame_slot()?;
         let scale = self.temporal_mode.scale();
         let render_size = if self.temporal_mode == TemporalUpscaleMode::Off {
             size
@@ -1928,7 +1954,13 @@ impl Renderer3D4 {
             -2.0 * jitter[1] / render_size[1] as f32,
         ];
         let frame = frame_uniform(camera, look, aspect, prev, clip_jitter);
-        self.frame_buffer.write(0, bytemuck::bytes_of(&frame))?;
+        let frame_buffer = self
+            .scene_frame_slots
+            .get(scene_slot_index)
+            .context("scene MTL4 frame buffer slot is missing")?
+            .frame_buffer
+            .clone();
+        frame_buffer.write(0, bytemuck::bytes_of(&frame))?;
         let mut line_vertices = Vec::with_capacity(lines.len() + lines_on_top.len());
         line_vertices.extend_from_slice(lines);
         let under_count = line_vertices.len();
@@ -1967,7 +1999,12 @@ impl Renderer3D4 {
         depth_attachment.set_clear_depth(0.0)?;
         pass.set_depth_attachment(Some(&depth_attachment))?;
 
-        let allocator = self.device.new_mtl4_command_allocator()?;
+        let allocator = self
+            .scene_frame_slots
+            .get(scene_slot_index)
+            .context("scene MTL4 allocator slot is missing")?
+            .allocator
+            .clone();
         let mut command_buffer = self
             .device
             .new_mtl4_command_buffer()?
@@ -1988,7 +2025,7 @@ impl Renderer3D4 {
                 Some(&self.argument_table),
                 RenderStages::RenderStageVertex | RenderStages::RenderStageFragment,
             )?;
-            self.argument_table.set_buffer(&self.frame_buffer, 0, 0)?;
+            self.argument_table.set_buffer(&frame_buffer, 0, 0)?;
 
             for model in models {
                 if model.n_instances == 0 {
