@@ -18,7 +18,8 @@ use metal_rust::metal4::{
     CommandAllocator, CompilerDescriptor, LibraryDescriptor, LibraryFunctionDescriptor,
     RecordingRenderEncoder,
     RenderPassDescriptor, RenderPipelineBuildDescriptor, RenderPipelineColorAttachmentDescriptor,
-    RenderPipelineDescriptor, TextureOriginSelection, TextureRegionSelection, VisibilityOptions,
+    RenderPipelineDescriptor, SubmittedCommandBuffers, TextureOriginSelection,
+    TextureRegionSelection, VisibilityOptions,
 };
 use metal_rust::metal_fx::FrameInterpolatorDescriptor;
 use std::collections::HashMap;
@@ -955,6 +956,7 @@ struct Target {
 struct SceneFrameSlot {
     allocator: CommandAllocator,
     frame_buffer: Buffer,
+    pending: Option<SubmittedCommandBuffers>,
 }
 
 pub struct Renderer3D4 {
@@ -994,6 +996,16 @@ pub struct Renderer3D4 {
 }
 
 impl Renderer3D4 {
+    fn drain_scene_frame_slots(&mut self) -> anyhow::Result<()> {
+        for slot in &mut self.scene_frame_slots {
+            if let Some(pending) = slot.pending.take() {
+                pending.wait()?;
+            }
+            slot.allocator.reset_safe()?;
+        }
+        Ok(())
+    }
+
     fn begin_scene_frame_slot(&mut self) -> anyhow::Result<usize> {
         let slot_index = self.scene_frame_slot;
         self.scene_frame_slot = (slot_index + 1) % self.scene_frame_slots.len().max(1);
@@ -1001,6 +1013,9 @@ impl Renderer3D4 {
             .scene_frame_slots
             .get_mut(slot_index)
             .context("scene MTL4 frame slot is missing")?;
+        if let Some(pending) = slot.pending.take() {
+            pending.wait()?;
+        }
         slot.allocator.reset_safe()?;
         Ok(slot_index)
     }
@@ -1116,6 +1131,7 @@ impl Renderer3D4 {
             scene_frame_slots.push(SceneFrameSlot {
                 allocator,
                 frame_buffer,
+                pending: None,
             });
         }
         residency.add_allocations(&[ResidencyAllocation::Texture(&fallback_texture)])?;
@@ -2180,9 +2196,11 @@ impl Renderer3D4 {
             self.previous_real_frame_time = Some(now);
             self.frame_generation_frame = self.frame_generation_frame.wrapping_add(1);
         }
-        self.queue
-            .submit(vec![command_buffer.end()?], None)?
-            .wait()?;
+        let submission = self.queue.submit(vec![command_buffer.end()?], None)?;
+        self.scene_frame_slots
+            .get_mut(scene_slot_index)
+            .context("scene MTL4 submission slot is missing")?
+            .pending = Some(submission);
         self.draws = draw_count;
         self.prev_view_projection = view_projection;
         self.temporal_frame = self.temporal_frame.wrapping_add(1);
@@ -2217,6 +2235,7 @@ impl Renderer3D4 {
     }
 
     pub fn read_back(&mut self) -> anyhow::Result<Option<(u32, u32, Vec<u8>)>> {
+        self.drain_scene_frame_slots()?;
         let Some(target) = self.target.as_ref() else {
             return Ok(None);
         };
@@ -2542,6 +2561,7 @@ impl Renderer3D4 {
         size: [u32; 2],
         clear: [f64; 4],
     ) -> anyhow::Result<Vec<u8>> {
+        self.drain_scene_frame_slots()?;
         self.ensure_target(size)?;
         let byte_length = (size[0] as usize)
             .checked_mul(size[1] as usize)

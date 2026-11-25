@@ -185,7 +185,7 @@ impl Painter {
                 std::mem::size_of::<UiUniforms>(),
                 ResourceOptions::SHARED,
             )?;
-            let vertex_capacity = 1024 * 1024;
+            let vertex_capacity = 4 * 1024 * 1024;
             let vertex_buffer = device.new_buffer(vertex_capacity, ResourceOptions::SHARED)?;
             residency.add_allocations(&[
                 ResidencyAllocation::Buffer(&uniform_buffer),
@@ -340,16 +340,11 @@ impl Painter {
                 .get_mut(slot_index)
                 .context("egui MTL4 vertex slot is missing")?;
             if needed > slot.vertex_capacity {
-                let new_capacity = slot.vertex_capacity.max(needed).next_power_of_two();
-                let new_buffer =
-                    self.device.new_buffer(new_capacity, ResourceOptions::SHARED)?;
-                self.residency
-                    .remove_allocation(ResidencyAllocation::Buffer(&slot.vertex_buffer))?;
-                self.residency
-                    .add_allocation(ResidencyAllocation::Buffer(&new_buffer))?;
-                self.residency.commit()?;
-                slot.vertex_buffer = new_buffer;
-                slot.vertex_capacity = new_capacity;
+                bail!(
+                    "egui vertex buffer needs {} bytes, ring slot capacity is {}",
+                    needed,
+                    slot.vertex_capacity,
+                );
             }
             slot
                 .vertex_buffer
